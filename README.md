@@ -5,6 +5,10 @@ Fetch image cutouts of LSST DP2 deep coadds from the
 
 It is a single Python 3 script with no dependencies outside the standard library.
 
+## Disclaimer
+
+All credits go to Claude Code 2.1.327. Prompted by AV.
+
 ## Setup
 
 Create an access token with the `read:tap` and `read:image` scopes at
