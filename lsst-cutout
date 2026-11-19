@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""lsst-cutout - fetch LSST DP2 deep_coadd cutouts as FITS.
+
+usage: lsst-cutout [-t] [-r RADIUS] BAND OBJECTID > cutout.fits
+       lsst-cutout [-t] [-r RADIUS] BAND RA DEC  > cutout.fits
+       lsst-cutout [-t] [-r RADIUS] [-j N] [-p] [--clobber] -o DIR BAND < targets
+
+BAND is one or more of ugrizy (e.g. r, gr, ugrizy); RA, DEC and RADIUS are
+ICRS degrees. With no target arguments, targets are read from stdin, one
+"OBJECTID" or "RA DEC" per line (blank lines and #comments ignored); each
+cutout is written to DIR/<name>/<band>_<radius>.fits, where <name> is the
+objectId or <ra>_<dec> and <radius> is e.g. 36arcsec, and its path printed on
+stdout. With -p, each target's cutouts are also drawn side by side, with
+photometry from dp2.Object, in DIR/<name>/<bands>_<radius>.png. Existing
+output files are kept, and only what is missing is fetched or drawn, unless
+--clobber is given.
+Requires RSP_TOKEN: an RSP access token with read:tap and read:image scopes.
+"""
+
+import argparse
+import base64
+import concurrent.futures
+import functools
+import math
+import os
+import struct
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+API = "https://data.lsst.cloud/api"
+COLLECTION = "LSST.DP2"
+OBJECT_TABLE = "dp2.Object"
+SUBTYPE = "lsst.deep_coadd"
+ID_CHUNK = 500     # objectIds per TAP query
+TIMING = False     # set by -t
+OBJECT_COLUMNS = ("objectId", "coord_ra", "coord_dec", "tract", "patch")
+PLOT_COLUMNS = ("i_ra", "i_dec")  # plus <band>_psfMag for each band
+
+
+class Fail(Exception):
+    """An error affecting one target, or the whole run."""
+
+
+def die(msg):
+    raise Fail(msg)
+
+
+def log(msg):
+    sys.stderr.write(f"lsst-cutout: {msg}\n")
+
+
+class SameHostAuth(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but send the token only to the original host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new and urllib.parse.urlsplit(newurl).netloc != \
+                urllib.parse.urlsplit(req.full_url).netloc:
+            new.remove_header("Authorization")
+        return new
+
+
+OPENER = urllib.request.build_opener(SameHostAuth)
+
+
+def fetch(url, token, data=None, stage="request"):
+    """GET (or POST if data) with the token."""
+    body = urllib.parse.urlencode(data).encode() if data else None
+    req = urllib.request.Request(url, data=body)
+    req.add_header("Authorization", f"Bearer {token}")
+    where = url.split("?")[0]
+    try:
+        t0 = time.monotonic()
+        with OPENER.open(req) as r:
+            t1 = time.monotonic()
+            out = r.read()
+            t2 = time.monotonic()
+            if TIMING:  # wait: until response headers (incl. redirects)
+                hop = "" if r.geturl() == url else \
+                    f", via {urllib.parse.urlsplit(r.geturl()).netloc}"
+                log(f"{stage:<9} {t2 - t0:6.2f}s  (wait {t1 - t0:.2f}s, "
+                    f"read {t2 - t1:.2f}s, {len(out):,} bytes{hop})")
+            return out
+    except urllib.error.HTTPError as e:
+        text = e.read().decode(errors="replace").strip()
+        auth = e.headers.get("WWW-Authenticate")
+        die(f"HTTP {e.code} from {where}"
+            + (f"\nWWW-Authenticate: {auth}" if auth else "")
+            + (f"\n{text[:1000]}" if text else ""))
+    except urllib.error.URLError as e:
+        die(f"{where}: {e.reason}")
+
+
+# VOTable datatype -> (struct code, bytes) for BINARY/BINARY2 serialization
+VOTYPES = {"boolean": ("c", 1), "unsignedByte": ("B", 1), "short": ("h", 2),
+           "int": ("i", 4), "long": ("q", 8), "char": ("s", 1),
+           "unicodeChar": ("s", 2), "float": ("f", 4), "double": ("d", 8)}
+
+
+def _local(el):
+    return el.tag.rsplit("}", 1)[-1]
+
+
+def _binary_rows(data, fields, null_mask):
+    """Decode a VOTable BINARY (null_mask=False) or BINARY2 stream."""
+    rows, pos, n = [], 0, len(fields)
+    while pos < len(data):
+        nulls = data[pos:pos + (n + 7) // 8] if null_mask else b""
+        pos += len(nulls)
+        row = {}
+        for k, f in enumerate(fields):
+            dtype, size = VOTYPES[f.get("datatype")]
+            asz = f.get("arraysize")
+            if asz is None:
+                count = 1
+            elif "*" in asz:
+                count = struct.unpack_from(">I", data, pos)[0]
+                pos += 4
+            else:
+                count = math.prod(int(d) for d in asz.split("x"))
+            raw = data[pos:pos + count * size]
+            pos += count * size
+            if nulls and nulls[k // 8] & (0x80 >> (k % 8)):
+                val = None
+            elif f.get("datatype") == "char":
+                val = raw.decode("ascii", "replace").rstrip("\0")
+            elif f.get("datatype") == "unicodeChar":
+                val = raw.decode("utf-16-be", "replace").rstrip("\0")
+            elif f.get("datatype") == "boolean":
+                val = [{"T": True, "t": True, "1": True, "F": False,
+                        "f": False, "0": False}.get(chr(b)) for b in raw]
+                val = val[0] if asz is None else val
+            else:
+                val = struct.unpack(f">{count}{dtype}", raw)
+                val = val[0] if asz is None else val
+            row[f.get("name")] = val
+        rows.append(row)
+    return rows
+
+
+def tap(query, token, columns, stage="tap"):
+    """Run a sync ADQL query; return rows as dicts. Parses the VOTable reply."""
+    out = fetch(f"{API}/tap/sync", token, {"LANG": "ADQL", "QUERY": query},
+                stage)
+    fail = f"\nquery: {query[:500]}"
+    try:
+        root = ET.fromstring(out)
+    except ET.ParseError:
+        die(f"TAP reply is not a VOTable: {out[:500]!r}{fail}")
+    for el in root.iter():
+        if _local(el) == "INFO" and el.get("name") == "QUERY_STATUS" \
+                and el.get("value") == "ERROR":
+            die(f"TAP query failed: {(el.text or '').strip()}{fail}")
+    table = next((el for el in root.iter() if _local(el) == "TABLE"), None)
+    if table is None:
+        die(f"TAP reply has no table{fail}")
+    fields = [el for el in table if _local(el) == "FIELD"]
+    names = [f.get("name") for f in fields]
+    missing = set(columns) - set(names)
+    if missing:
+        die(f"TAP result lacks {', '.join(sorted(missing))}; got {names}{fail}")
+    data = next((el for el in table if _local(el) == "DATA"), None)
+    if data is None or not len(data):
+        return []
+    ser = data[0]
+    if _local(ser) == "TABLEDATA":
+        return [dict(zip(names, ((td.text or "").strip() for td in tr)))
+                for tr in ser]
+    if _local(ser) in ("BINARY", "BINARY2"):
+        stream = next(el for el in ser if _local(el) == "STREAM")
+        return _binary_rows(base64.b64decode(stream.text or ""), fields,
+                            _local(ser) == "BINARY2")
+    die(f"unsupported VOTable serialization {_local(ser)}{fail}")
+
+
+# --- pipeline --------------------------------------------------------------
+
+def separation(ra1, dec1, ra2, dec2):
+    r1, d1, r2, d2 = map(math.radians, (ra1, dec1, ra2, dec2))
+    return math.acos(min(1.0, math.sin(d1) * math.sin(d2) +
+                         math.cos(d1) * math.cos(d2) * math.cos(r1 - r2)))
+
+
+def object_rows(object_ids, columns, token):
+    """{objectId: row} with the given dp2.Object columns, in few queries."""
+    ids = sorted(set(object_ids))
+    rows = {}
+    for i in range(0, len(ids), ID_CHUNK):
+        chunk = ids[i:i + ID_CHUNK]
+        where = f"objectId = {chunk[0]}" if len(chunk) == 1 else \
+            f"objectId IN ({', '.join(map(str, chunk))})"
+        for row in tap(f"SELECT {', '.join(columns)} FROM {OBJECT_TABLE} "
+                       f"WHERE {where}", token, columns, "object"):
+            rows[int(row["objectId"])] = row
+    return rows
+
+
+def _bands(bands):
+    return ", ".join(f"'{b}'" for b in bands)
+
+
+def patch_images(bands, tracts, token):
+    """{(tract, patch, band): DataLink URL} of the images in the given tracts."""
+    rows = tap("SELECT access_url, lsst_tract, lsst_patch, lsst_band "
+               "FROM ivoa.ObsCore "
+               f"WHERE lsst_tract IN ({', '.join(map(str, sorted(tracts)))}) "
+               f"AND obs_collection = '{COLLECTION}' "
+               f"AND dataproduct_subtype = '{SUBTYPE}' "
+               f"AND lsst_band IN ({_bands(bands)})", token,
+               ("access_url", "lsst_tract", "lsst_patch", "lsst_band"), "obscore")
+    return {(int(r["lsst_tract"]), int(r["lsst_patch"]), r["lsst_band"]):
+            r["access_url"] for r in rows}
+
+
+def datalink_urls(bands, ra, dec, token):
+    """{band: DataLink URL} of the images containing (ra, dec), nearest centre."""
+    rows = tap("SELECT access_url, lsst_band, s_ra, s_dec FROM ivoa.ObsCore "
+               f"WHERE CONTAINS(POINT('ICRS', {ra}, {dec}), s_region) = 1 "
+               f"AND obs_collection = '{COLLECTION}' "
+               f"AND dataproduct_subtype = '{SUBTYPE}' "
+               f"AND lsst_band IN ({_bands(bands)})", token,
+               ("access_url", "lsst_band", "s_ra", "s_dec"), "obscore")
+    best = {}
+    for r in sorted(rows, key=lambda r: -separation(
+            ra, dec, float(r["s_ra"]), float(r["s_dec"]))):
+        best[r["lsst_band"]] = r["access_url"]  # nearest centre written last
+    return best
+
+
+@functools.lru_cache(maxsize=None)  # nearby targets share an image
+def cutout_service(dl_url, token):
+    """(accessURL, ID) of the 'cutout-sync' service descriptor in DataLink."""
+    root = ET.fromstring(fetch(dl_url, token, stage="datalink"))
+    for res in root.iter():
+        if res.tag.endswith("RESOURCE") and res.get("ID") == "cutout-sync":
+            params = {p.get("name"): p.get("value")
+                      for p in res.iter() if p.tag.endswith("PARAM")}
+            if params.get("accessURL") and params.get("ID"):
+                return params["accessURL"], params["ID"]
+    die(f"no cutout-sync service in DataLink response from {dl_url}")
+
+
+def resolve(bands, targets, columns, token):
+    """[(name, target info or Fail)]; info is a dict with ra, dec, the
+    dp2.Object row (objectId targets) and dl: {band: DataLink URL}, or None
+    for RA DEC targets, whose images are looked up per target later.
+
+    objectIds are resolved in bulk, to the images of the patch the object was
+    measured on.
+    """
+    ids = [t for _, t in targets if isinstance(t, int)]
+    rows = object_rows(ids, columns, token) if ids else {}
+    images = patch_images(bands, {int(r["tract"]) for r in rows.values()},
+                          token) if rows else {}
+    out = []
+    for name, t in targets:
+        if not isinstance(t, int):
+            out.append((name, {"ra": t[0], "dec": t[1], "row": None, "dl": None}))
+        elif t not in rows:
+            out.append((name, Fail(f"objectId {t} not found in {OBJECT_TABLE}")))
+        else:
+            r = rows[t]
+            key = int(r["tract"]), int(r["patch"])
+            out.append((name, {
+                "ra": float(r["coord_ra"]), "dec": float(r["coord_dec"]),
+                "row": r, "dl": {b: images[(*key, b)] for b in bands
+                                 if (*key, b) in images}}))
+    return out
+
+
+def cutout(info, band, radius, token):
+    """FITS bytes of the BAND cutout around the target."""
+    ra, dec = info["ra"], info["dec"]
+    if band not in info["dl"]:
+        die(f"no {SUBTYPE} image in band {band} covers {ra} {dec}")
+    url, image_id = cutout_service(info["dl"][band], token)
+    return fetch(url, token, {"ID": image_id, "CIRCLE": f"{ra} {dec} {radius}"},
+                 "cutout")
+
+
+# --- gallery (-p) -----------------------------------------------------------
+
+def plot_gallery(path, info, bands, cutouts, radius):
+    """Write a PNG with the cutouts of BANDS side by side.
+
+    cutouts: {band: FITS bytes}; missing bands get no panel. Each panel shows
+    the object +- RADIUS (deg), so cutouts clipped at an image edge stay
+    centred. All panels share the colour scale of band i if present, else of
+    the reddest band present.
+    """
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.wcs.utils import proj_plane_pixel_scales
+
+    def image(data):  # first 2-d HDU with a celestial WCS
+        with fits.open(io.BytesIO(data)) as hdul:
+            for hdu in hdul:
+                if hdu.data is not None and hdu.data.ndim == 2:
+                    wcs = WCS(hdu.header)
+                    if wcs.has_celestial:
+                        return np.asarray(hdu.data, dtype=float), wcs
+        return None
+
+    images = {b: image(cutouts[b]) for b in bands if b in cutouts}
+    images = {b: im for b, im in images.items() if im is not None}
+    if not images:
+        die("no cutout to draw")
+    ref = "i" if "i" in images else list(images)[-1]
+    vmin, vmax = np.nanquantile(images[ref][0], [0.0, 0.995])
+    row = info["row"] or {}
+
+    def num(key):
+        v = row.get(key)
+        return float("nan") if v is None else float(v)
+
+    ra, dec = (num("i_ra"), num("i_dec")) if row else (info["ra"], info["dec"])
+    if not (math.isfinite(ra) and math.isfinite(dec)):
+        ra, dec = info["ra"], info["dec"]
+
+    fig, axes = plt.subplots(1, len(bands), figsize=(len(bands) * 6.4 * 0.75, 1.0 * 4.8),
+                             dpi=300, squeeze=False, layout="constrained")
+    for ax, band in zip(axes[0], bands):
+        ax.set_aspect(1.0)
+        im = images.get(band)
+        if im is None or im[0].size < 1000:  # missing or clipped at an edge
+            ax.remove()
+            continue
+        v, wcs = im
+        ax.imshow(v, vmin=vmin, vmax=vmax, cmap=matplotlib.cm.gist_heat,
+                  origin="lower")
+        x, y = (float(c) for c in wcs.world_to_pixel_values(ra, dec))
+        arcsec = proj_plane_pixel_scales(wcs.celestial)[1] * 3600  # per pixel
+        half = radius * 3600 / arcsec  # view: object +- radius, in pixels
+        n = 2 * half
+        ax.set_xlim(x - half, x + half)
+        ax.set_ylim(y - half, y + half)
+        ax.set_facecolor("0.3")  # outside the image the cutout came from
+        s1, s2 = 0.05 * n, 0.10 * n  # crosshair arms: 5% of the view long
+        ax.plot([x, x], [y - s1, y - s2], "w", lw=2.0)
+        ax.plot([x - s1, x - s2], [y, y], "w", lw=2.0)
+        ax.text(0.1, 0.9, f"lsst-{band}", transform=ax.transAxes, color="w")
+        # 0.1 arcmin scale bar
+        bar = 6.0 / arcsec
+        x0, y0 = x - half + 0.1 * n, y - half + 0.1 * n
+        ax.plot([x0, x0 + bar], [y0, y0], "w-", lw=2.0)
+        ax.text(x0, y0 + 0.02 * n, "0.1'", color="white")
+
+    if row:
+        mags = {b: num(f"{b}_psfMag") for b in bands}
+        text = [f"objectId: {row['objectId']}", f"i_ra: {ra:.5f}",
+                f"i_dec: {dec:.5f}"] + [f"{b}: {m:.2f}" for b, m in mags.items()]
+        text += [f"{x}-{y}: {mags[x] - mags[y]:.2f}" for x, y in ("gr", "iz")
+                 if x in mags and y in mags]
+    else:
+        text = [f"ra: {ra:.5f}", f"dec: {dec:.5f}"]
+    fig.suptitle(", ".join(text))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.part"
+    fig.savefig(tmp, format="png")
+    plt.close(fig)
+    os.replace(tmp, path)
+
+
+# --- command line ----------------------------------------------------------
+
+def bands_arg(text):
+    """'rg' -> 'gr': distinct letters of ugrizy, in ugrizy order."""
+    if not text or set(text) - set("ugrizy"):
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: give one or more of the bands ugrizy, e.g. r or gri")
+    return "".join(b for b in "ugrizy" if b in text)
+
+
+def parse_target(tokens):
+    """objectId (int) or (ra, dec) from 1 or 2 string tokens."""
+    if len(tokens) == 1:
+        return int(tokens[0])
+    if len(tokens) == 2:
+        return float(tokens[0]), float(tokens[1])
+    raise ValueError("give either OBJECTID or RA DEC")
+
+
+def read_targets(lines):
+    targets, seen = [], set()
+    for n, line in enumerate(lines, 1):
+        tokens = line.split("#", 1)[0].replace(",", " ").split()
+        if not tokens:
+            continue
+        try:
+            t = parse_target(tokens)
+        except ValueError:
+            die(f"stdin line {n}: expected OBJECTID or RA DEC, got {line.strip()!r}")
+        name = tokens[0] if isinstance(t, int) else f"{tokens[0]}_{tokens[1]}"
+        if name not in seen:  # same output file: fetch once
+            seen.add(name)
+            targets.append((name, t))
+    return targets
+
+
+def radius_label(deg):
+    """0.01 -> '36arcsec': the largest unit that keeps the number >= 1."""
+    for unit, scale in (("deg", 1), ("arcmin", 60), ("arcsec", 3600)):
+        if deg * scale >= 1 or unit == "arcsec":
+            return f"{deg * scale:g}{unit}"
+
+
+def write_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def run(a, p):
+    token = os.environ.get("RSP_TOKEN", "").strip() or die("RSP_TOKEN not set")
+    if a.plot and not a.outdir:
+        p.error("-p needs -o DIR (targets on stdin)")
+    if a.target:
+        if a.outdir:
+            p.error("-o is for targets read from stdin")
+        if len(a.band) > 1:
+            p.error("several bands need -o DIR (targets on stdin)")
+        if sys.stdout.isatty():
+            die("refusing to write FITS to a terminal; redirect stdout")
+        try:
+            targets = [("-", parse_target(a.target))]
+        except ValueError:
+            p.error("give OBJECTID (an integer) or RA DEC (numbers)")
+    else:
+        if not a.outdir:
+            p.error("give OBJECTID or RA DEC, or -o DIR with targets on stdin")
+        if sys.stdin.isatty():
+            p.error("reading targets from stdin, but stdin is a terminal")
+        targets = read_targets(sys.stdin)
+        os.makedirs(a.outdir, exist_ok=True)
+
+    start = time.monotonic()
+    bands = a.band
+    size = radius_label(a.radius)
+
+    def fits_path(name, band):
+        return os.path.join(a.outdir, name, f"{band}_{size}.fits")
+
+    def png_path(name):
+        return os.path.join(a.outdir, name, f"{bands}_{size}.png")
+
+    # what to make for each target; existing files are kept unless --clobber
+    fetch, draw, kept = {}, set(), 0
+    for name, _ in targets:
+        if a.target:  # stdout: no files involved
+            fetch[name] = bands
+            continue
+        fetch[name] = "".join(b for b in bands if a.clobber or
+                              not os.path.exists(fits_path(name, b)))
+        if a.plot and (a.clobber or not os.path.exists(png_path(name))):
+            draw.add(name)
+        old = [fits_path(name, b) for b in bands if b not in fetch[name]]
+        old += [png_path(name)] if a.plot and name not in draw else []
+        for path in old:
+            print(path, flush=True)
+        kept += len(old)
+    targets = [(n, t) for n, t in targets if fetch[n] or n in draw]
+    wanted = sum(len(fetch[n]) for n, _ in targets)
+
+    failed = 0
+    todo = []
+    columns = OBJECT_COLUMNS + ((PLOT_COLUMNS + tuple(
+        f"{b}_psfMag" for b in bands)) if a.plot else ())
+    for name, info in resolve(bands, targets, columns, token) if targets else []:
+        if isinstance(info, Fail):
+            if a.target:
+                raise info
+            failed += len(fetch[name]) or 1
+            log(f"{name}: {info}")
+        else:
+            todo.append((name, info))
+
+    infos = dict(todo)
+    got = {name: {b: open(fits_path(name, b), "rb").read()  # for the gallery
+                  for b in bands if b not in fetch[name]}
+           for name, _ in todo if name in draw}
+    pending = {name: len(fetch[name]) for name, _ in todo}
+
+    def gallery(name):
+        nonlocal failed
+        if not got.get(name):
+            return
+        try:
+            plot_gallery(png_path(name), infos[name], bands, got.pop(name),
+                         a.radius)
+            print(png_path(name), flush=True)
+        except Fail as e:
+            failed += 1
+            log(f"{name}: {e}")
+
+    with concurrent.futures.ThreadPoolExecutor(max(1, a.jobs)) as pool:
+        # RA DEC targets: one image search each, for all bands
+        lookups = {pool.submit(datalink_urls, bands, i["ra"], i["dec"], token): i
+                   for name, i in todo if i["dl"] is None and fetch[name]}
+        for fut in concurrent.futures.as_completed(lookups):
+            try:
+                lookups[fut]["dl"] = fut.result()
+            except Fail as e:
+                lookups[fut]["dl"] = {}
+                lookups[fut]["error"] = e
+
+        futures = {pool.submit(cutout, info, b, a.radius, token): (name, b)
+                   for name, info in todo if "error" not in info
+                   for b in fetch[name]}
+        for name, info in todo:
+            if "error" in info:
+                if a.target:
+                    raise info["error"]
+                failed += len(fetch[name])
+                log(f"{name}: {info['error']}")
+            elif not pending[name] and name in draw:  # only the gallery is missing
+                gallery(name)
+        for fut in concurrent.futures.as_completed(futures):
+            name, band = futures[fut]
+            try:
+                data = fut.result()
+            except Fail as e:
+                if a.target:
+                    raise
+                failed += 1
+                log(f"{name}: band {band}: {e}")
+            else:
+                if a.target:
+                    sys.stdout.buffer.write(data)
+                    continue
+                write_file(fits_path(name, band), data)
+                print(fits_path(name, band), flush=True)
+                if name in got:
+                    got[name][band] = data
+            pending[name] -= 1
+            if not pending[name] and name in draw:
+                gallery(name)
+
+    if kept:
+        log(f"kept {kept} existing file{'s' * (kept != 1)} "
+            "(--clobber to overwrite)")
+    if TIMING:
+        log(f"{'total':<9} {time.monotonic() - start:6.2f}s  "
+            f"({wanted - failed} cutouts ok, {failed} failed, {kept} kept)")
+    return 1 if failed else 0
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="lsst-cutout", description=__doc__.split("\n")[0],
+        usage="%(prog)s [-t] [-r RADIUS] BAND (OBJECTID | RA DEC) > cutout.fits\n"
+              "       %(prog)s [-t] [-r RADIUS] [-j N] [-p] [--clobber] -o DIR BAND"
+              " < targets")
+    p.add_argument("-r", "--radius", type=float, default=0.01,
+                   help="cutout radius in degrees (default: 0.01)")
+    p.add_argument("-o", "--outdir", metavar="DIR",
+                   help="read targets from stdin and write cutouts here")
+    p.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                   help="targets fetched in parallel (default: 1)")
+    p.add_argument("-p", "--plot", action="store_true",
+                   help="also draw the BAND cutouts side by side in "
+                        "DIR/<name>/<bands>_<radius>.png "
+                        "(needs astropy, numpy, matplotlib)")
+    p.add_argument("--clobber", action="store_true",
+                   help="overwrite existing output files (default: keep them "
+                        "and skip their targets)")
+    p.add_argument("-t", "--timing", action="store_true",
+                   help="print per-stage timings to stderr")
+    p.add_argument("band", type=bands_arg, metavar="BAND",
+                   help="one or more of ugrizy, e.g. r, gr or ugrizy")
+    p.add_argument("target", nargs="*", metavar="OBJECTID | RA DEC")
+    a = p.parse_args()
+    global TIMING
+    TIMING = a.timing
+    try:
+        sys.exit(run(a, p))
+    except Fail as e:
+        sys.exit(f"lsst-cutout: {e}")
+
+
+if __name__ == "__main__":
+    main()
